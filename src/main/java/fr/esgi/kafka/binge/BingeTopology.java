@@ -38,10 +38,6 @@ public final class BingeTopology {
                 Topics.PLAYBACK_EVENTS,
                 Consumed.with(Serdes.String(), Serdes.String()));
 
-        // Sanity check de demarrage : verifiez la connexion au cluster,
-        // puis SUPPRIMEZ ce peek (il pollue les logs et coute cher).
-        raw.peek((key, value) -> System.out.println("[binge] " + key + " -> " + value));
-
         // Routage valide / invalide (split/branch)
         // On valide sur le JSON brut (pas encore parse) pour pouvoir garder
         // le texte original si le message part en DLQ (tache suivante).
