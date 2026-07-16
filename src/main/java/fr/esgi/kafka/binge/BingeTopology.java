@@ -4,11 +4,14 @@ import fr.esgi.kafka.binge.common.JsonSerdes;
 import fr.esgi.kafka.binge.model.PlaybackEvent;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.Map;
 import java.util.Set;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.Named;
 
 /**
  * Construisez ici la topologie du projet BINGE.
@@ -39,19 +42,27 @@ public final class BingeTopology {
         // puis SUPPRIMEZ ce peek (il pollue les logs et coute cher).
         raw.peek((key, value) -> System.out.println("[binge] " + key + " -> " + value));
 
-        // Parsing sûr (poison pill)
-        // JSON illisible (tronque, vide, non-JSON) -> null au lieu d'une
-        // exception qui ferait planter l'appli en boucle.
-        KStream<String, PlaybackEvent> parsed = raw.mapValues(
+        // Routage valide / invalide (split/branch)
+        // On valide sur le JSON brut (pas encore parse) pour pouvoir garder
+        // le texte original si le message part en DLQ (tache suivante).
+        // isValid() regroupe : parsing sur (poison pill) + les 3 validations
+        // des taches precedentes (champs requis, types/bornes, enums).
+        Map<String, KStream<String, String>> routed = raw.split(Named.as("route-"))
+                .branch((key, value) -> isValid(value), Branched.as("valid"))
+                .defaultBranch(Branched.as("invalid"));
+
+        KStream<String, String> validRaw = routed.get("route-valid");
+        KStream<String, String> invalidRaw = routed.get("route-invalid");
+
+        // La branche valide peut maintenant etre parsee sans risque : le
+        // predicat isValid() a deja garanti un JSON lisible et conforme.
+        KStream<String, PlaybackEvent> validEvents = validRaw.mapValues(
                 value -> JsonSerdes.parseOrNull(value, PlaybackEvent.class));
 
         // -----------------------------------------------------------------
         // BINGE-1 - Ingestion fiable
-        //   (validation branchee au fil des taches suivantes)
-        //   Parser chaque message (model.PlaybackEvent), le valider, puis
-        //   router : valides -> suite du pipeline, invalides -> Topics.DLQ
-        //   (conserver le message original et ajouter la raison du rejet).
-        //   Pistes : split()/branch(), JsonSerdes.parseOrNull(...).
+        //   invalidRaw -> a envelopper en {"reason":..., "raw":...} et
+        //   publier vers Topics.DLQ (tache suivante : construction DLQ).
         // -----------------------------------------------------------------
 
         // BINGE-2 - Compteur de vues par contenu        -> Topics.VIEWS_BY_TITLE
@@ -60,6 +71,19 @@ public final class BingeTopology {
         // BINGE-4 - Alerte qualite "buffering storm"    -> Topics.ALERTS_QOE
         // BINGE-5 - Sessions utilisateur (session windows) -> Topics.SESSIONS
         // BINGE-6 (bonus) - API REST Interactive Queries (cf. README)
+    }
+
+    // Routage valide / invalide - regle de validite globale
+    // Un message est valide si : il parse (pas un poison pill), ET les
+    // champs requis sont presents, ET les types/bornes sont corrects, ET
+    // les enums sont reconnus. Les 4 conditions viennent des taches
+    // precedentes ; celle-ci ne fait que les combiner.
+    private static boolean isValid(String rawJson) {
+        PlaybackEvent event = JsonSerdes.parseOrNull(rawJson, PlaybackEvent.class);
+        return event != null
+                && hasRequiredFields(event)
+                && hasValidTypesAndBounds(event)
+                && hasValidEnums(event);
     }
 
     // Validation des champs requis
