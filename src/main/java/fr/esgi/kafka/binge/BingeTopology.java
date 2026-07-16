@@ -4,6 +4,7 @@ import fr.esgi.kafka.binge.common.JsonSerdes;
 import fr.esgi.kafka.binge.model.PlaybackEvent;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.Set;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Consumed;
@@ -16,6 +17,13 @@ import org.apache.kafka.streams.kstream.KStream;
  * commentaires rappellent seulement l'objectif et les APIs candidates.
  */
 public final class BingeTopology {
+
+    private static final Set<String> VALID_EVENT_TYPES =
+            Set.of("PLAY", "PAUSE", "HEARTBEAT", "BUFFERING", "STOP");
+    private static final Set<String> VALID_DEVICES =
+            Set.of("TV", "MOBILE", "WEB", "CONSOLE");
+    private static final Set<String> VALID_REGIONS =
+            Set.of("EU-FR", "EU-DE", "EU-ES", "US-EAST", "US-WEST", "APAC");
 
     private BingeTopology() {
     }
@@ -81,5 +89,16 @@ public final class BingeTopology {
             return false;
         }
         return true;
+    }
+
+    // Validation des enums
+    // event_type/device/region doivent appartenir aux valeurs autorisees par
+    // le README. Une valeur inconnue (faute de frappe du SDK, ex. "PLAYY")
+    // finirait en branche morte plus loin si on ne la rejette pas ici.
+    // Set.contains(null) renvoie false, donc un champ absent est aussi rejete.
+    private static boolean hasValidEnums(PlaybackEvent event) {
+        return VALID_EVENT_TYPES.contains(event.eventType())
+                && VALID_DEVICES.contains(event.device())
+                && VALID_REGIONS.contains(event.region());
     }
 }
