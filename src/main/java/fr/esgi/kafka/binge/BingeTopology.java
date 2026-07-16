@@ -2,6 +2,8 @@ package fr.esgi.kafka.binge;
 
 import fr.esgi.kafka.binge.common.JsonSerdes;
 import fr.esgi.kafka.binge.model.PlaybackEvent;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Consumed;
@@ -62,5 +64,22 @@ public final class BingeTopology {
                 && event.userId() != null
                 && event.contentId() != null
                 && event.timestamp() != null;
+    }
+
+    // Validation des types et des bornes
+    // position_seconds doit etre >= 0 (une position de lecture negative n'a
+    // pas de sens) et le timestamp doit etre une date ISO-8601 valide. Les
+    // mauvais types bruts (ex. position_seconds: "douze") sont deja rejetes
+    // en amont par parseOrNull (tache "parsing sur").
+    private static boolean hasValidTypesAndBounds(PlaybackEvent event) {
+        if (event.positionSeconds() == null || event.positionSeconds() < 0) {
+            return false;
+        }
+        try {
+            Instant.parse(event.timestamp());
+        } catch (DateTimeParseException | NullPointerException e) {
+            return false;
+        }
+        return true;
     }
 }
