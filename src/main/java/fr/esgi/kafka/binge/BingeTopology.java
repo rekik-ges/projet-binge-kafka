@@ -1,5 +1,7 @@
 package fr.esgi.kafka.binge;
 
+import fr.esgi.kafka.binge.common.JsonSerdes;
+import fr.esgi.kafka.binge.model.PlaybackEvent;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Consumed;
@@ -26,6 +28,12 @@ public final class BingeTopology {
         // Sanity check de demarrage : verifiez la connexion au cluster,
         // puis SUPPRIMEZ ce peek (il pollue les logs et coute cher).
         raw.peek((key, value) -> System.out.println("[binge] " + key + " -> " + value));
+
+        // Parsing sûr (poison pill)
+        // JSON illisible (tronque, vide, non-JSON) -> null au lieu d'une
+        // exception qui ferait planter l'appli en boucle.
+        KStream<String, PlaybackEvent> parsed = raw.mapValues(
+                value -> JsonSerdes.parseOrNull(value, PlaybackEvent.class));
 
         // -----------------------------------------------------------------
         // BINGE-1 - Ingestion fiable
