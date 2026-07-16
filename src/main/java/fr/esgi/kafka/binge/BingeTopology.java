@@ -37,6 +37,7 @@ public final class BingeTopology {
 
         // -----------------------------------------------------------------
         // BINGE-1 - Ingestion fiable
+        //   (validation branchee au fil des taches suivantes)
         //   Parser chaque message (model.PlaybackEvent), le valider, puis
         //   router : valides -> suite du pipeline, invalides -> Topics.DLQ
         //   (conserver le message original et ajouter la raison du rejet).
@@ -49,5 +50,17 @@ public final class BingeTopology {
         // BINGE-4 - Alerte qualite "buffering storm"    -> Topics.ALERTS_QOE
         // BINGE-5 - Sessions utilisateur (session windows) -> Topics.SESSIONS
         // BINGE-6 (bonus) - API REST Interactive Queries (cf. README)
+    }
+
+    // Validation des champs requis
+    // Un evenement dont un champ obligatoire est absent (null) est invalide.
+    // Ne verifie que la presence des champs pour l'instant (types/bornes et
+    // enums sont geres dans des taches suivantes).
+    private static boolean hasRequiredFields(PlaybackEvent event) {
+        return event.eventId() != null
+                && event.eventType() != null
+                && event.userId() != null
+                && event.contentId() != null
+                && event.timestamp() != null;
     }
 }
