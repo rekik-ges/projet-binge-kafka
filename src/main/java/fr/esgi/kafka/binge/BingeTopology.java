@@ -59,10 +59,17 @@ public final class BingeTopology {
         KStream<String, PlaybackEvent> validEvents = validRaw.mapValues(
                 value -> JsonSerdes.parseOrNull(value, PlaybackEvent.class));
 
+        // Construction du message DLQ (reason + raw)
+        // On reproduit les memes verifications que isValid(), mais ici pour
+        // en extraire une raison lisible plutot qu'un simple booleen.
+        // L'enveloppe garde le JSON original intact (raw) a cote de reason.
+        KStream<String, String> dlqMessages = invalidRaw.mapValues(
+                value -> JsonSerdes.toJson(new DlqEnvelope(rejectReason(value), value)));
+        dlqMessages.to(Topics.DLQ);
+
         // -----------------------------------------------------------------
-        // BINGE-1 - Ingestion fiable
-        //   invalidRaw -> a envelopper en {"reason":..., "raw":...} et
-        //   publier vers Topics.DLQ (tache suivante : construction DLQ).
+        // BINGE-1 - Ingestion fiable : socle termine (parsing, validation,
+        //   routage, DLQ motivee). validEvents alimente les tickets suivants.
         // -----------------------------------------------------------------
 
         // BINGE-2 - Compteur de vues par contenu        -> Topics.VIEWS_BY_TITLE
@@ -71,6 +78,34 @@ public final class BingeTopology {
         // BINGE-4 - Alerte qualite "buffering storm"    -> Topics.ALERTS_QOE
         // BINGE-5 - Sessions utilisateur (session windows) -> Topics.SESSIONS
         // BINGE-6 (bonus) - API REST Interactive Queries (cf. README)
+    }
+
+    // Construction du message DLQ - forme de l'enveloppe {"reason":..., "raw":...}
+    // Jackson serialise un record via ses accesseurs : les noms de champs
+    // produits dans le JSON sont donc exactement "reason" et "raw".
+    private record DlqEnvelope(String reason, String raw) {
+    }
+
+    // Construction du message DLQ - raison precise du rejet
+    // Reprend les memes verifications que isValid(), dans le meme ordre,
+    // pour renvoyer la premiere raison qui explique le rejet (plutot qu'un
+    // simple booleen). Necessaire pour respecter le critere "DLQ motivee :
+    // on compte les raisons distinctes".
+    private static String rejectReason(String rawJson) {
+        PlaybackEvent event = JsonSerdes.parseOrNull(rawJson, PlaybackEvent.class);
+        if (event == null) {
+            return "JSON illisible (tronque, vide ou mal forme)";
+        }
+        if (!hasRequiredFields(event)) {
+            return "champ requis absent ou null";
+        }
+        if (!hasValidTypesAndBounds(event)) {
+            return "type invalide ou valeur hors bornes (position_seconds/timestamp)";
+        }
+        if (!hasValidEnums(event)) {
+            return "valeur enum inconnue (event_type/device/region)";
+        }
+        return "raison indeterminee";
     }
 
     // Routage valide / invalide - regle de validite globale
