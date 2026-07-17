@@ -4,4 +4,8 @@ target/
 *.iml
 .vscode/
 .DS_Store
-generateurs-v3/
+generateurs-v3/.venv/
+generateurs-v3/data/*
+!generateurs-v3/data/binge/
+__pycache__/
+*.pyc
