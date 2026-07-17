@@ -1,21 +1,27 @@
 package fr.esgi.kafka.binge;
 
 import fr.esgi.kafka.binge.common.JsonSerdes;
+import fr.esgi.kafka.binge.model.CatalogItem;
 import fr.esgi.kafka.binge.model.PlaybackEvent;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.Map;
 import java.util.Set;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.GlobalKTable;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Named;
+import org.apache.kafka.streams.kstream.TimeWindows;
+import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.processor.api.Processor;
 import org.apache.kafka.streams.processor.api.ProcessorContext;
 import org.apache.kafka.streams.processor.api.Record;
@@ -39,6 +45,7 @@ public final class BingeTopology {
 
     private static final String DEDUP_STORE_NAME = "binge-unique-play-events-store";
     private static final String VIEWS_STORE_NAME = "binge-views-by-title-store";
+    private static final String TRENDING_STORE_NAME = "binge-trending-store";
 
     private BingeTopology() {
     }
@@ -109,8 +116,43 @@ public final class BingeTopology {
                 .mapValues((contentId, count) -> JsonSerdes.toJson(new ViewsByTitle(contentId, count)))
                 .to(Topics.VIEWS_BY_TITLE);
 
-        // BINGE-3 - Top tendances par genre (fenetres + jointure catalogue)
-        //                                               -> Topics.TRENDING
+        // BINGE-3 - Top tendances par genre
+        // Catalogue charge en GlobalKTable : petit volume, disponible en
+        // entier sur chaque instance, pas besoin de co-partitionnement avec
+        // le flux principal (contrairement a une KTable classique).
+        GlobalKTable<String, CatalogItem> catalogTable = builder.globalTable(
+                Topics.CATALOG,
+                Consumed.with(Serdes.String(), JsonSerdes.of(CatalogItem.class)));
+
+        // Fenetre hopping 10 min / avance 1 min. Grace period 180 min : le
+        // jeu de donnees contient des retardataires jusqu'a 180 min ; sans
+        // grace period ils seraient exclus silencieusement des fenetres.
+        KTable<Windowed<String>, Long> trendingCounts = uniquePlayEvents
+                .groupBy((key, event) -> event.contentId(),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(PlaybackEvent.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(10), Duration.ofMinutes(180))
+                        .advanceBy(Duration.ofMinutes(1)))
+                .count(Materialized.as(TRENDING_STORE_NAME));
+
+        // leftJoin (pas join) : un content_id absent du catalogue ne doit
+        // pas faire disparaitre la ligne ni faire planter la jointure.
+        trendingCounts.toStream()
+                .leftJoin(catalogTable,
+                        (windowedKey, count) -> windowedKey.key(),
+                        TrendingJoined::new)
+                .map((windowedKey, joined) -> {
+                    String contentId = windowedKey.key();
+                    String title = joined.catalog() != null ? joined.catalog().title() : "titre inconnu";
+                    String genre = joined.catalog() != null ? joined.catalog().genre() : "genre inconnu";
+                    TrendingEntry entry = new TrendingEntry(
+                            contentId, title, genre,
+                            Instant.ofEpochMilli(windowedKey.window().start()).toString(),
+                            Instant.ofEpochMilli(windowedKey.window().end()).toString(),
+                            joined.count());
+                    return KeyValue.pair(contentId, JsonSerdes.toJson(entry));
+                })
+                .to(Topics.TRENDING);
+
         // BINGE-4 - Alerte qualite "buffering storm"    -> Topics.ALERTS_QOE
         // BINGE-5 - Sessions utilisateur (session windows) -> Topics.SESSIONS
         // BINGE-6 (bonus) - API REST Interactive Queries (cf. README)
@@ -118,6 +160,18 @@ public final class BingeTopology {
 
     // Comptage de vues - forme de l'enveloppe {"contentId":..., "count":...}
     private record ViewsByTitle(String contentId, long count) {
+    }
+
+    // Top tendances - resultat intermediaire de la jointure GlobalKTable
+    // catalog peut etre null (leftJoin) si le content_id est absent du
+    // catalogue - gere explicitement au moment de construire TrendingEntry.
+    private record TrendingJoined(long count, CatalogItem catalog) {
+    }
+
+    // Top tendances - forme de l'enveloppe de sortie (titre + genre + fenetre + compte)
+    private record TrendingEntry(
+            String contentId, String title, String genre,
+            String windowStart, String windowEnd, long count) {
     }
 
     // Dedoublonnage par event_id (BINGE-2)
