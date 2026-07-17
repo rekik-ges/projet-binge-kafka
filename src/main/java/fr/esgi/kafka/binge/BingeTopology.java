@@ -46,6 +46,8 @@ public final class BingeTopology {
     private static final String DEDUP_STORE_NAME = "binge-unique-play-events-store";
     private static final String VIEWS_STORE_NAME = "binge-views-by-title-store";
     private static final String TRENDING_STORE_NAME = "binge-trending-store";
+    private static final String BUFFERING_STORE_NAME = "binge-buffering-per-minute-store";
+    private static final long BUFFERING_STORM_THRESHOLD = 30;
 
     private BingeTopology() {
     }
@@ -153,7 +155,37 @@ public final class BingeTopology {
                 })
                 .to(Topics.TRENDING);
 
-        // BINGE-4 - Alerte qualite "buffering storm"    -> Topics.ALERTS_QOE
+        // BINGE-4 - Alerte qualite "buffering storm"
+        // Cle composite (content_id|region) : groupBy exige une seule cle.
+        KStream<String, PlaybackEvent> bufferingEvents = validEvents.filter(
+                (key, event) -> "BUFFERING".equals(event.eventType()));
+
+        // Fenetre tumbling 1 min, grace period volontairement courte (2 min,
+        // pas 180 min comme BINGE-3) : une alerte doit rester quasi temps
+        // reel, une grace de plusieurs heures la rendrait inutile en prod.
+        KTable<Windowed<String>, Long> bufferingPerMinute = bufferingEvents
+                .groupBy((key, event) -> event.contentId() + "|" + event.region(),
+                        Grouped.with(Serdes.String(), JsonSerdes.of(PlaybackEvent.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(1), Duration.ofMinutes(2)))
+                .count(Materialized.as(BUFFERING_STORE_NAME));
+
+        // Pas de suppress() : on veut voir l'alerte des que le seuil est
+        // franchi, pas seulement a la fermeture de la fenetre (coherent
+        // avec "alertes visibles pendant les tempetes").
+        bufferingPerMinute.toStream()
+                .filter((windowedKey, count) -> count >= BUFFERING_STORM_THRESHOLD)
+                .map((windowedKey, count) -> {
+                    String[] parts = windowedKey.key().split("\\|", 2);
+                    String contentId = parts[0];
+                    String region = parts.length > 1 ? parts[1] : "";
+                    AlertQoe alert = new AlertQoe(contentId, region,
+                            Instant.ofEpochMilli(windowedKey.window().start()).toString(),
+                            Instant.ofEpochMilli(windowedKey.window().end()).toString(),
+                            count);
+                    return KeyValue.pair(contentId + "|" + region, JsonSerdes.toJson(alert));
+                })
+                .to(Topics.ALERTS_QOE);
+
         // BINGE-5 - Sessions utilisateur (session windows) -> Topics.SESSIONS
         // BINGE-6 (bonus) - API REST Interactive Queries (cf. README)
     }
@@ -172,6 +204,12 @@ public final class BingeTopology {
     private record TrendingEntry(
             String contentId, String title, String genre,
             String windowStart, String windowEnd, long count) {
+    }
+
+    // Alerte QoE - forme de l'enveloppe de sortie (buffering storm)
+    private record AlertQoe(
+            String contentId, String region,
+            String windowStart, String windowEnd, long bufferingCount) {
     }
 
     // Dedoublonnage par event_id (BINGE-2)
