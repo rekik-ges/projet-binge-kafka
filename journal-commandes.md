@@ -1,101 +1,76 @@
-# Journal des commandes — Projet BINGE
+# Socle BINGE-1 — Ingestion, validation, DLQ
 
-Fichier personnel de suivi (pas destiné au rendu final).
-Chaque section = une petite tâche, avec les commandes exécutées.
+## Lancer l'application
 
----
-
-## Ticket socle (BINGE-1)
-
-### Étape 1 — setup projet
-
+**1. Démarrer le cluster Kafka local**
 ```bash
-# Créer .gitignore à la racine avec ce contenu :
-target/
-*.class
-.idea/
-*.iml
-.vscode/
-.DS_Store
-
-# Vérifier que le projet compile
-mvn compile
-
-# Démarrer l'environnement Kafka local (3 brokers + Kafbat UI)
 docker compose up -d
-
-# Vérifier que les conteneurs tournent
-docker compose ps
-
-# Confirmer dans le navigateur
-http://localhost:8080
-
-# Ajouter les fichiers au commit
-git add .
-
-# Vérifier ce qui est prêt à être commité
-git status
-
-# Commit
-git commit -m "socle - mise en place du projet"
 ```
+Lance 3 brokers Kafka + l'interface Kafbat UI (`http://localhost:8080`) pour visualiser les topics.
 
-Prérequis installés en cours de route (absents au départ) :
-```bash
-# JDK 21 (le projet l'exige, seul le JDK 11 était installé)
-winget install EclipseAdoptium.Temurin.21.JDK
-
-# Maven (absent, pas trouvé via winget -> installation manuelle)
-# téléchargé depuis https://maven.apache.org/download.cgi (apache-maven-3.9.16-bin.zip)
-# extrait dans C:\maven
-
-# Ajouter Maven au PATH utilisateur
-[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\maven\apache-maven-3.9.16\bin", "User")
-
-# Pointer JAVA_HOME vers le JDK 21 (sinon Maven prend le JDK 11 par défaut)
-[Environment]::SetEnvironmentVariable("JAVA_HOME", "C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot", "User")
+**2. Lancer l'application**
+```powershell
+$env:GROUPE = "grp07"
+$env:KAFKA_BOOTSTRAP = "localhost:29092"
+mvn compile exec:java
 ```
-
-Après un redémarrage du PC, si `docker ps` renvoie une erreur "Internal Server Error" :
-```bash
-docker context use desktop-linux   # si le contexte CLI pointe sur le mauvais pipe
-wsl --shutdown                     # relance propre du moteur Docker (WSL2)
-# puis : Quitter Docker Desktop et le rouvrir, attendre "Engine running"
-```
-
-Piège rencontré : `.gitignore` s'est retrouvé encodé en UTF-16 (via l'IDE), ce qui empêchait
-Git de lire les règles correctement (`target/` n'était pas ignoré). Réécrit en UTF-8 via :
-```bash
-printf 'target/\n*.class\n.idea/\n*.iml\n.vscode/\n.DS_Store\n' > .gitignore
-```
+`GROUPE` préfixe tous nos topics de sortie (ex: `grp07.binge.dlq`) pour ne pas écraser ceux des autres groupes.
 
 ---
 
-### Étape 2 — parsing sûr (poison pill)
+## Étapes du socle
 
-Modification dans `BingeTopology.java` : ajout des imports `PlaybackEvent` et `JsonSerdes`,
-puis ajout de la transformation :
-```java
-// Parsing sûr (poison pill)
-KStream<String, PlaybackEvent> parsed = raw.mapValues(
-        value -> JsonSerdes.parseOrNull(value, PlaybackEvent.class));
+### 1. Setup projet
+Mise en place de l'environnement (JDK 21, Maven, cluster Kafka local via Docker).
+**Modification** : aucun code — vérification que le projet compile et que l'appli se connecte au cluster.
+
+### 2. Parsing sûr (poison pill)
+Un JSON illisible (tronqué, vide, mal formé) ne doit jamais faire planter l'application en boucle.
+**Modification** : on a remplacé la lecture directe du JSON brut par un parsing protégé, `JsonSerdes.parseOrNull()` (fourni), utilisé dans `isValid()` et `rejectReason()` (`BingeTopology.java`) — un JSON illisible devient `null` au lieu de lever une exception.
+
+### 3. Validation des champs requis
+Un événement sans `content_id`, `event_type`, etc. ne doit pas être traité comme valide.
+**Modification** : on a ajouté la méthode `hasRequiredFields(PlaybackEvent)` (`BingeTopology.java`), qui vérifie que `event_id`, `event_type`, `user_id`, `content_id` et `timestamp` ne sont pas `null`.
+
+### 4. Validation des types et des bornes
+Un `position_seconds` négatif ou un `timestamp` illisible faussent les statistiques sans faire planter l'appli.
+**Modification** : on a ajouté la méthode `hasValidTypesAndBounds(PlaybackEvent)` (`BingeTopology.java`), qui rejette `position_seconds < 0` et les timestamps qui échouent au parsing `Instant.parse()`.
+
+### 5. Validation des enums
+Une valeur comme `"event_type": "PLAYY"` (faute de frappe du SDK) doit être détectée avant de finir en branche morte plus loin.
+**Modification** : on a ajouté 3 listes de valeurs autorisées (`VALID_EVENT_TYPES`, `VALID_DEVICES`, `VALID_REGIONS`) et la méthode `hasValidEnums(PlaybackEvent)` (`BingeTopology.java`), qui vérifie que `event_type`/`device`/`region` appartiennent à ces listes.
+
+### 6. Routage valide / invalide
+Il faut séparer le flux en deux : les messages qui passent toutes les validations, et les autres.
+**Modification** : on a remplacé le flux unique par un `raw.split()...branch()...defaultBranch()` (`BingeTopology.build()`), piloté par la méthode `isValid(String)` qui combine les 3 validations précédentes (tâches 3 à 5) en une seule règle.
+
+### 7. Construction du message DLQ
+Un message rejeté sans raison ne sert à rien pour déboguer ou justifier le rejet.
+**Modification** : on a ajouté le record `DlqEnvelope(reason, raw)` et la méthode `rejectReason(String)` (`BingeTopology.java`), puis branché la sortie invalide vers `Topics.DLQ` — chaque rejet part avec sa raison précise et le JSON original intact.
+
+### 8. Nettoyage
+Le `peek()` fourni servait juste à vérifier la connexion au tout début, il n'a plus d'utilité une fois la validation en place.
+**Modification** : on a supprimé les 3 lignes du `peek()` de démonstration dans `BingeTopology.build()`.
+
+### 9. Test de robustesse (10 minutes)
+Vérifier que le socle tient face à un vrai volume de données, pas juste sur quelques exemples choisis à la main.
+**Modification** : aucun code — rejeu du jeu de données réel (140 418 événements fournis par l'enseignant) vers le cluster local, application laissée active 10 minutes. Résultat : aucun crash, ~6,4% des messages rejetés en DLQ avec raisons motivées, cohérent avec les ~7% d'anomalies annoncées dans le sujet.
+
+**Ce qu'on a fait, avec les commandes :**
+
+1. Rejouer le jeu de données réel (fourni par l'enseignant, dossier `generateurs-v3/data/binge`) vers le cluster local :
+```powershell
+python rejouer.py --dossier data/binge --project binge --create-topics --replication-factor 1 --bootstrap localhost:29092
+```
+→ Envoie les 140 418 événements + les 576 fiches catalogue vers `binge.playback.events` et `binge.catalog`.
+
+2. L'application (déjà lancée, cf. section "Lancer l'application") consomme et traite ce flux automatiquement — rien à faire de plus ici.
+
+3. Observer les rejets en direct dans un terminal séparé, pour voir les raisons motivées défiler :
+```powershell
+docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic grp07.binge.dlq --from-beginning
 ```
 
-```bash
-# Vérifier que ça compile (forcé, pour éviter un faux "Nothing to compile")
-mvn clean compile
+4. Laisser l'application tourner 10 minutes sans l'arrêter, en surveillant qu'aucune erreur/exception n'apparaît dans son terminal.
 
-git add .gitignore src/main/java/fr/esgi/kafka/binge/BingeTopology.java
-git commit -m "socle - parsing JSON sans crash sur poison pill"
-```
-
-Correction annexe : `target/` était suivi par Git depuis le tout premier commit (avant que
-le `.gitignore` soit actif). Retiré du suivi sans supprimer les fichiers du disque :
-```bash
-git rm -r --cached target/
-git commit -m "socle - retrait de target/ du suivi git (fichiers compiles)"
-```
-
----
-
-### Étape 3 — validation des champs requis (à venir)
+5. Vérifier les volumes dans Kafbat UI (`http://localhost:8080` → Topics) : `binge.playback.events` (140 419 messages) vs `grp07.binge.dlq` (8 925 messages, soit ~6,4%).
